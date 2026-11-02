@@ -1,0 +1,89 @@
+name: Release
+
+# 推送 v* 标签时自动编译、打包、创建 Release。
+# 之所以把构建搬到 GitHub 上做：本机到 github.com:443 断断续续，
+# 但 22 端口的 git 推送是稳定的，让云端 runner 完成剩下的工作。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build universal binary
+        run: |
+          set -euo pipefail
+          swiftc -O -target arm64-apple-macos13.0  -o build-arm64 main.swift
+          swiftc -O -target x86_64-apple-macos13.0 -o build-x86   main.swift
+          lipo -create build-arm64 build-x86 -o ArchivePreview
+          file ArchivePreview
+
+      - name: Assemble app bundle
+        run: |
+          set -euo pipefail
+          APP="压缩包预览器.app"
+          rm -rf "$APP" stage zstage
+          mkdir -p "$APP/Contents/MacOS"
+          cp ArchivePreview "$APP/Contents/MacOS/压缩包预览器"
+          cp Info.plist "$APP/Contents/Info.plist"
+          codesign --force --deep --sign - "$APP"
+          codesign -dv "$APP" 2>&1 | grep -E 'Format|Signature' || true
+
+          # dmg 用：应用 + 指向 /Applications 的快捷方式
+          mkdir -p stage
+          ditto "$APP" "stage/压缩包预览器.app"
+          ln -s /Applications stage/Applications
+          cp LICENSE "stage/LICENSE.txt"
+
+          # zip 用：应用 + 文档
+          mkdir -p zstage
+          ditto "$APP" "zstage/压缩包预览器.app"
+          cp README.md LICENSE zstage/
+
+      - name: Package dmg and zip
+        run: |
+          set -euo pipefail
+          VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          hdiutil create -volname "压缩包预览器 ${VER}" \
+            -srcfolder stage -ov -format UDZO -fs HFS+ "ArchivePreview-${VER}.dmg"
+          ditto -c -k --keepParent zstage "ArchivePreview-${VER}.zip"
+          ls -lh ArchivePreview-*.dmg ArchivePreview-*.zip
+
+      - name: Compose release body
+        run: |
+          set -euo pipefail
+          cp docs/RELEASE-NOTES.md body.md
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "**SHA256**"
+            echo ""
+            echo '```'
+            shasum -a 256 "ArchivePreview-${VER}.dmg" "ArchivePreview-${VER}.zip"
+            echo '```'
+            echo ""
+            echo "构建于 GitHub Actions（macos-14），提交 \`${GITHUB_SHA:0:7}\`。"
+          } >> body.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: body.md
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: |
+            ArchivePreview-*.dmg
+            ArchivePreview-*.zip
