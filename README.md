@@ -22,9 +22,11 @@ macOS 自带的「归档实用工具」只要双击就开始解压，不管你�
 |---|---|
 | 树形目录 | 文件夹可展开/折叠，默认全部折叠，只显示顶层；工具栏有「展开全部」「折叠」 |
 | 字符集切换 | 自动识别 / UTF-8 / GB18030-GBK / Big5 / Shift-JIS / EUC-KR / Latin-1，切换时保留展开状态 |
+| 解压同编码 | 解出后的文件名和列表里看到的一致，不会「预览正常、解压乱码」 |
 | 选择性解压 | 解压选中项 / 解压全部 / 解压到同名文件夹 |
 | 搜索过滤 | 按路径或文件名筛选，命中时自动展开所有层级 |
 | 大小与时间 | 每项显示大小、修改时间（统一为 `2026-11-01 22:54` 格式） |
+| 自动清垃圾 | 自动跳过 `__MACOSX`、`.DS_Store`；解压到 ExFAT 等非 APFS 卷时也不留 `._xxx` 影子文件 |
 | 接管双击 | 可设为 8 种归档格式的默认打开方式，随时一键还原 |
 
 ## 支持的格式
@@ -86,6 +88,22 @@ killall lsd
 **rar / 7z 走系统 libarchive**
 macOS 的 `/usr/bin/tar` 就是 bsdtar（libarchive 3.7.4），内置 7z 和 rar 读取。列表解析 `tar -tvf` 的字节流（同样保留原始名字节），解压用 `tar -xf`。
 
+**解压必须用和列表相同的编码**
+这是 v1.1.2 之前最严重的一个 bug：列表里中文名显示正常，点解压却报
+`checkdir error: cannot create ... Invalid argument`。
+
+原因是预览自己解码（GBK 认对了），解压却交给 `/usr/bin/unzip`——它按 CP437
+解释没有 UTF-8 标志位的文件名，GBK 字节被解成问号和非法字节，`mkdir` 直接 EINVAL。
+
+修法是解压也改为走 libarchive，并把当前生效的编码通过
+`--options hdrcharset=GB18030` 传过去。为此新增 `detectEncoding()` 把「自动识别」
+落成一个具体编码（UTF-8 逐条验证不过就按 GB18030），列表和解压共用同一个结果，
+保证两边永远一致。
+
+注意不能靠「哪种编码成功率最高」来猜：GBK 的字节在 EUC-KR / Big5 下同样是合法
+双字节组合，成功率都是 100%，实测纯 GBK 中文包会被误判成 EUC-KR 解出满屏韩文。
+所以只做「是不是 UTF-8」的判定，其余一律 GB18030，其它编码由用户手动指定。
+
 **几个踩过的坑**（改代码前值得看）
 
 - **NSViewController 必须被强持有**。只设 `win.contentView = vc.view` 而 `vc` 是局部变量，控制器会被释放，`NSTableView.dataSource`（weak）变 nil，表格行全部消失，表现为「界面一片空白」。`AppDelegate.controller` 就是为此存在。
@@ -93,6 +111,9 @@ macOS 的 `/usr/bin/tar` 就是 bsdtar（libarchive 3.7.4），内置 7z 和 rar
 - **`Node` 必须继承 `NSObject`**。纯 Swift class 传给 AppKit 会被包成 `__SwiftValue`，`as? Node` 必失败。
 - **改 `Info.plist` 后必须重新登记**：`lsregister -u` → `lsregister -f` → `SetHandler set` → `killall lsd`，少一步 `lsd` 重启后关联会回退。
 - **没有 Xcode.app 时 SwiftUI 编译不了**（宏插件缺失），所以界面是纯 AppKit。
+- **`._xxx` 影子文件枚举不到**。macOS 在 ExFAT / FAT32 这类卷上会为每个文件额外写 `._同名`，但这些文件被系统当作 AppleDouble，`FileManager.enumerator` 和 `contentsOfDirectory` **都看不见**（`ls`、`find` 能看见）。清理只能借助 `find`，不能在 Swift 里遍历。
+- **`find -delete` 删不掉非空目录**，`__MACOSX` 里装着 `._` 文件，必须用 `-exec rm -rf {} +`。
+- **tar 的 `--exclude "__MACOSX/*"` 只能挡一层**，深层目录照样会被建出来。别指望前置排除，统一在解压后清理。
 
 ## 调试参数
 
@@ -107,6 +128,9 @@ macOS 的 `/usr/bin/tar` 就是 bsdtar（libarchive 3.7.4），内置 7z 和 rar
 
 # 把界面渲染成 PNG（不依赖显示器/录屏权限）
 "... 压缩包预览器" test.zip --snapshot=/tmp/ui.png --expand --select=3
+
+# 直接解压到指定目录，不开窗口（会打印所用的编码）
+"... 压缩包预览器" test.zip --extract=/tmp/out
 ```
 
 `--snapshot=` 是进程内用 `wantsLayer + display() + layer.render()` 输出图片的。`--expand` 展开全部目录，`--select=N` 选中第 N 行。
@@ -129,6 +153,24 @@ ArchivePreview/
 - 大包（数万条目）首屏解析会卡顿，上限 20000 条目
 - 只读，不支持在预览界面里增删改文件
 - 没有做代码签名和公证，别人下载后首次运行需右键 → 打开
+- 压缩包里如果含 ExFAT / Windows 不允许的字符（`: * ? " < > |`），解到那块盘上会被系统拒绝
+
+## 更新记录
+
+### v1.2
+
+- **修复：中文文件名解压失败**。之前解压交给 `unzip`，它按 CP437 解释 GBK 字节，
+  文件名变成问号和非法字节，报 `checkdir error: Invalid argument`。
+  现在解压也走 libarchive 并显式传入 `hdrcharset`，与列表显示的编码完全一致。
+- 解压前预建目录，兼容目录条目不规范（缺尾部斜杠）的包
+- 解压后自动清理 `__MACOSX`、`.DS_Store`，非 APFS 卷上还清掉 `._xxx` 影子文件
+- 新增 `--extract=<dir>` 命令行解压参数
+
+### v1.1
+
+- 树形目录（默认折叠）、字符集切换
+- 支持 rar / 7z（复用系统 libarchive）
+- 选中行高亮贯通整行，日期格式统一
 
 ## License
 

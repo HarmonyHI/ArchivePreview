@@ -37,6 +37,46 @@ enum NameEncoding: Int, CaseIterable {
         case .latin1: return .isoLatin1
         }
     }
+
+    /// 传给 libarchive（`--options hdrcharset=`）的字符集名。
+    /// 解压必须用和列表显示完全相同的编码，否则文件名会解码成问号或非法字节。
+    var archiveCharset: String? {
+        switch self {
+        case .auto: return nil
+        case .utf8: return "UTF-8"
+        case .gb18030: return "GB18030"
+        case .big5: return "BIG5"
+        case .shiftJIS: return "CP932"
+        case .eucKR: return "EUC-KR"
+        case .latin1: return "CP437"
+        }
+    }
+}
+
+/// 根据整个包的条目判定实际编码。
+/// 用于把「自动识别」落到一个具体编码上——解压时只能传一个编码，
+/// 必须和列表里解码用的是同一个，否则会出现「列表显示正常、解压全是问号」。
+func detectEncoding(_ entries: [RawEntry]) -> NameEncoding {
+    let sample = Array(entries.prefix(300)).filter { !$0.nameBytes.isEmpty }
+    guard !sample.isEmpty else { return .utf8 }
+
+    // 纯 ASCII 名字：什么编码都一样
+    if sample.allSatisfy({ $0.nameBytes.allSatisfy { $0 < 0x80 } }) { return .utf8 }
+
+    // 全部条目标了 UTF-8 标志位，直接信它
+    if sample.allSatisfy({ $0.utf8Flag }) { return .utf8 }
+
+    // 没标志位但内容是合法 UTF-8（macOS 自己打的包常见这种情况）
+    let utf8OK = sample.filter { String(data: $0.nameBytes, encoding: .utf8) != nil }.count
+    if Double(utf8OK) >= Double(sample.count) * 0.98 { return .utf8 }
+
+    // 其余情况一律按 GB18030。
+    //
+    // 这里不做「哪个编码成功率最高」的竞争：GBK 的字节序列在 EUC-KR、Big5 下
+    // 往往同样是合法的双字节组合，成功率都是 100%，靠这个根本分不出来
+    // （实测一个纯 GBK 的中文包会被误判成 EUC-KR，解出来全是韩文）。
+    // 简体中文是绝对主流场景，其余编码交给用户在下拉菜单里手动指定。
+    return .gb18030
 }
 
 /// 把归档里的原始文件名字节按指定字符集解码
@@ -392,27 +432,88 @@ func buildTree(_ items: [(String, RawEntry)]) -> Node {
 
 // MARK: - 解压
 
-func performExtract(_ path: String, kind: ArchiveKind, names: [String]?, to dest: String) -> (ok: Bool, msg: String) {
+/// 目标卷是否支持扩展属性（APFS / HFS+ 支持，ExFAT / FAT32 / 网络盘不支持）
+func volumeSupportsXattr(_ path: String) -> Bool {
+    var s = statfs()
+    guard statfs(path, &s) == 0 else { return true }
+    let t = withUnsafeBytes(of: &s.f_fstypename) { buf -> String in
+        String(decoding: buf.prefix(while: { $0 != 0 }), as: UTF8.self)
+    }
+    return t == "apfs" || t == "hfs"
+}
+
+/// 清理解压产生的 macOS 元数据垃圾：
+/// `__MACOSX` 目录、`.DS_Store`，以及（仅非 APFS 卷）`._xxx` 影子文件。
+///
+/// 注意：`._xxx` 被系统当作 AppleDouble 处理，**Foundation 的目录枚举会直接
+/// 跳过它们**（`FileManager.enumerator` / `contentsOfDirectory` 都看不到，
+/// 但 `ls` 和 `find` 能看到），所以必须借助 find，不能在 Swift 里自己遍历。
+///
+/// 另外 tar 的 `--exclude "__MACOSX/*"` 只能排除一层，深层目录照样会被建出来，
+/// 所以这里不做前置排除，统一在解压后清理。
+func cleanupJunk(_ dest: String, removeAppleDouble: Bool) {
+    var args = [dest, "-depth", "(", "-name", "__MACOSX", "-o", "-name", ".DS_Store"]
+    if removeAppleDouble { args += ["-o", "-name", "._*"] }
+    // 用 rm -rf 而不是 -delete：-delete 只删空目录，而 __MACOSX 里装着 ._xxx 文件，
+    // 目录非空就删不掉。
+    args += [")", "-exec", "/bin/rm", "-rf", "{}", "+"]
+    _ = runCommand("/usr/bin/find", args)
+}
+
+func performExtract(_ path: String, kind: ArchiveKind, names: [String]?, to dest: String,
+                    encoding: NameEncoding, dirs: [String]) -> (ok: Bool, msg: String) {
+    let fm = FileManager.default
     do {
-        try FileManager.default.createDirectory(atPath: dest, withIntermediateDirectories: true)
+        try fm.createDirectory(atPath: dest, withIntermediateDirectories: true)
     } catch {
         return (false, "无法创建目标文件夹：\n\(error.localizedDescription)")
     }
-    let exe: String
-    let args: [String]
-    switch kind {
-    case .zip:
-        exe = "/usr/bin/unzip"
-        args = ["-o", "-q", path] + (names ?? []) + ["-d", dest, "-x", "__MACOSX/*"]
-    case .tar:
-        exe = "/usr/bin/tar"
-        args = ["-xf", path, "-C", dest] + (names ?? [])
+
+    // 先把所有目录建出来。
+    // 有些包的目录条目没带尾部斜杠、或没标目录属性，解压器会把它当普通文件创建，
+    // 之后写子文件就报 "Not a directory"。预先建好可以绕开这类不规范包。
+    for d in dirs {
+        let full = (dest as NSString).appendingPathComponent(d)
+        try? fm.createDirectory(atPath: full, withIntermediateDirectories: true)
     }
-    let r = runCommand(exe, args)
+
+    var args: [String] = []
+
+    // 关键修复：ZIP 解压不再用 unzip。
+    // /usr/bin/unzip 按 CP437 解释没有 UTF-8 标志位的文件名，GBK 中文名会被解成
+    // 一堆问号和非法字节，随后 mkdir 直接 EINVAL（就是「checkdir error: Invalid argument」）。
+    // 改用系统自带的 libarchive（bsdtar），显式告诉它头部字符集，
+    // 与列表显示用的编码保持一致，解出来的名字才不会跟预览对不上。
+    if kind == .zip, let cs = encoding.archiveCharset {
+        args += ["--options", "hdrcharset=\(cs)"]
+    }
+
+    // 跳过 macOS 打包时塞进来的元数据（tar 的 --exclude 只能挡一层，后面还会统一清一次）
+    args += ["--exclude", "__MACOSX", "--exclude", ".DS_Store"]
+
+    args += ["-xf", path, "-C", dest]
+    if let names { args += names }
+
+    let r = runCommand("/usr/bin/tar", args)
     if r.code != 0 {
         let text = String(data: r.data, encoding: .utf8) ?? ""
-        return (false, "解压失败。\n\n\(text.suffix(700))")
+        // bsdtar 对「模式没匹配到任何条目」也返回非 0，这不是解压失败
+        let significant = text.split(separator: "\n").filter { line in
+            let l = line.lowercased()
+            if l.contains("not found in archive") { return false }
+            if l.contains("excluded filename not matched") { return false }
+            if l.trimmingCharacters(in: .whitespaces).isEmpty { return false }
+            return true
+        }
+        // 有真正的错误才判定失败；只是模式没匹配到也算成功（照样走清理）
+        if !significant.isEmpty {
+            return (false, "解压失败。\n\n\(significant.joined(separator: "\n").suffix(700))")
+        }
     }
+
+    // 清理解压产生的元数据垃圾（__MACOSX、.DS_Store，非 APFS 卷还有 ._xxx）
+    cleanupJunk(dest, removeAppleDouble: !volumeSupportsXattr(dest))
+
     return (true, dest)
 }
 
@@ -514,11 +615,17 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
     let archivePath: String
     let kind: ArchiveKind
     let rawEntries: [RawEntry]
+    /// 「自动识别」实际落到哪个编码上。列表显示和解压都统一用它，
+    /// 否则会出现列表正常、解压出来的文件名全是问号。
+    let detectedEncoding: NameEncoding
 
     var tree: Node = Node(name: "", path: "", isDir: true)
     var encoding: NameEncoding = .auto
     var expandedPaths = Set<String>()
     var firstLoad = true
+
+    /// 当前真正生效的编码（auto 时取检测结果）
+    var effectiveEncoding: NameEncoding { encoding == .auto ? detectedEncoding : encoding }
 
     let outline = NSOutlineView()
     let searchField = NSSearchField()
@@ -535,6 +642,7 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
         self.archivePath = path
         self.kind = kind
         self.rawEntries = entries
+        self.detectedEncoding = detectEncoding(entries)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -797,10 +905,11 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
         }
 
         let query = searchField.stringValue.trimmingCharacters(in: .whitespaces)
+        let enc = effectiveEncoding
         var items: [(String, RawEntry)] = []
         items.reserveCapacity(rawEntries.count)
         for e in rawEntries {
-            let name = decodeName(e.nameBytes, encoding, utf8Flagged: e.utf8Flag)
+            let name = decodeName(e.nameBytes, enc, utf8Flagged: e.utf8Flag)
             if !query.isEmpty && !name.localizedCaseInsensitiveContains(query) { continue }
             items.append((name, e))
         }
@@ -1014,11 +1123,16 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
 
     func extract(to dest: String) {
         let names = selectedNames()
+        let enc = effectiveEncoding
+        let dirs = rawEntries.filter { $0.isDir }
+                              .map { decodeName($0.nameBytes, enc, utf8Flagged: $0.utf8Flag) }
+                              .filter { !$0.isEmpty }
         busyBox?.isHidden = false
         spinner.startAnimation(nil)
         spinnerLabel.stringValue = "正在解压…"
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = performExtract(self.archivePath, kind: self.kind, names: names, to: dest)
+            let r = performExtract(self.archivePath, kind: self.kind, names: names,
+                                   to: dest, encoding: enc, dirs: dirs)
             DispatchQueue.main.async {
                 self.spinner.stopAnimation(nil)
                 self.busyBox?.isHidden = true
@@ -1249,6 +1363,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .ok(let kind, let entries):
             let c = PreviewController(path: path, kind: kind, entries: entries)
             if let e = encName { c.encoding = encodingFrom(e) }
+            // 隐藏参数：命令行直接解压，不弹窗口（用于验证解压逻辑 / 脚本调用）
+            if let arg = CommandLine.arguments.first(where: { $0.hasPrefix("--extract=") }) {
+                let dest = String(arg.dropFirst("--extract=".count))
+                let enc = c.effectiveEncoding
+                let dirs = entries.filter { $0.isDir }
+                                  .map { decodeName($0.nameBytes, enc, utf8Flagged: $0.utf8Flag) }
+                                  .filter { !$0.isEmpty }
+                let r = performExtract(path, kind: kind, names: nil, to: dest,
+                                       encoding: enc, dirs: dirs)
+                print("编码=\(enc.title)")
+                print(r.ok ? "OK: \(r.msg)" : "FAIL: \(r.msg)")
+                exit(r.ok ? 0 : 1)
+            }
             vc = c
             size = NSSize(width: 820, height: 600)
         case .unsupported(let note):
