@@ -102,6 +102,10 @@ struct RawEntry {
     var date: String
     var isDir: Bool
     var utf8Flag: Bool
+    /// ZIP 通用标志位 bit 0：该条目用口令加密。
+    /// 文件名和大小都在中央目录里、本身没被加密，所以不加口令也能照常列目录 ——
+    /// 这正是「先看目录、点开才要密码」的可行性基础。
+    var encrypted: Bool = false
 }
 
 enum ArchiveKind { case zip, tar }
@@ -119,14 +123,22 @@ enum ReadError: Error, LocalizedError {
 
 // MARK: - 通用工具
 
-func runCommand(_ exe: String, _ args: [String]) -> (data: Data, code: Int32) {
+func runCommand(_ exe: String, _ args: [String], timeout: TimeInterval = 120) -> (data: Data, code: Int32) {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: exe)
     proc.arguments = args
     let pipe = Pipe()
     proc.standardOutput = pipe
     proc.standardError = pipe
+    // stdin 接 /dev/null，挡掉「从 stdin 读输入」这类等待（注意这挡不住 /dev/tty，见下面的口令参数）
+    proc.standardInput = FileHandle.nullDevice
     do { try proc.run() } catch { return (Data(), -1) }
+    // 兜底：超时强杀，绝不让子进程把界面永久挂住
+    let watchdog = DispatchWorkItem {
+        if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+    }
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
+    defer { watchdog.cancel() }
     let handle = pipe.fileHandleForReading
     var buf = Data()
     while true {
@@ -267,11 +279,13 @@ func readZipEntries(_ path: String) throws -> [RawEntry] {
         }
 
         let utf8Flag = (flags & 0x800) != 0
+        let isEncrypted = (flags & 0x0001) != 0
         let unixMode = (extAttr >> 16) & 0xF000
         let isDir = nameData.last == 0x2F || unixMode == 0x4000 || (extAttr & 0x10) != 0
 
         entries.append(RawEntry(nameBytes: nameData, size: uncomp,
-                                date: dosDate(dosD, dosT), isDir: isDir, utf8Flag: utf8Flag))
+                                date: dosDate(dosD, dosT), isDir: isDir, utf8Flag: utf8Flag,
+                                encrypted: isEncrypted))
         p = nameStart + nameLen + extraLen + commentLen
         if entries.count >= entryLimit { break }
     }
@@ -358,6 +372,7 @@ final class Node: NSObject {
     var isDir: Bool
     var size: Int64 = 0
     var date: String = ""
+    var encrypted: Bool = false
     var children: [Node] = []
 
     init(name: String, path: String, isDir: Bool) {
@@ -421,6 +436,7 @@ func buildTree(_ items: [(String, RawEntry)]) -> Node {
             let node = Node(name: (p as NSString).lastPathComponent, path: p, isDir: false)
             node.size = entry.size
             node.date = entry.date
+            node.encrypted = entry.encrypted
             parent.children.append(node)
             index[p] = node
         }
@@ -487,13 +503,26 @@ func parentChain(of path: String) -> [String] {
     return out
 }
 
+/// libarchive 在「口令错误 / 缺口令」时的措辞。
+///
+/// 很坑的一点：这种情况下 bsdtar 的**退出码仍然是 0**，只把话写在 stderr 里，
+/// 而且会留下 0 字节或 CRC 不对的残文件。所以成败只能靠文本判断，不能看退出码。
+func isPasswordMessage(_ line: String, hadPassphrase: Bool) -> Bool {
+    let l = line.lowercased()
+    if l.contains("passphrase") || l.contains("password") || l.contains("encrypted") { return true }
+    // 带了口令还 CRC 校验失败，基本就是把正确的密文用错误的钥匙解了一遍
+    if hadPassphrase && l.contains("bad crc") { return true }
+    return false
+}
+
 func performExtract(_ path: String, kind: ArchiveKind, names: [String]?, to dest: String,
-                    encoding: NameEncoding, dirs: [String]) -> (ok: Bool, msg: String) {
+                    encoding: NameEncoding, dirs: [String],
+                    passphrase: String? = nil) -> (ok: Bool, msg: String, passwordError: Bool) {
     let fm = FileManager.default
     do {
         try fm.createDirectory(atPath: dest, withIntermediateDirectories: true)
     } catch {
-        return (false, "无法创建目标文件夹：\n\(error.localizedDescription)")
+        return (false, "无法创建目标文件夹：\n\(error.localizedDescription)", false)
     }
 
     // 先把所有目录建出来。
@@ -520,6 +549,7 @@ func performExtract(_ path: String, kind: ArchiveKind, names: [String]?, to dest
     if groups.isEmpty { groups.append([]) }   // 空数组 = 解压全部
 
     var failures: [String] = []
+    var passwordError = false
     for group in groups {
         var args: [String] = []
 
@@ -532,6 +562,19 @@ func performExtract(_ path: String, kind: ArchiveKind, names: [String]?, to dest
             args += ["--options", "hdrcharset=\(cs)"]
         }
 
+        // 口令参数必须**永远**给，而且不能是空串。
+        //
+        // 实测（bsdtar 3.5.3 / libarchive 3.7.4）：
+        // - 不给 --passphrase：碰到加密条目会去读 /dev/tty 要密码，没有终端就永久挂住；
+        //   把 stdin 接到 /dev/null 也没用，它读的是 /dev/tty 而不是 stdin。
+        // - 给空串：直接 "Empty passphrase is unacceptable" 报错退出。
+        // - 给错误口令：干脆地报 Incorrect passphrase 然后退出，不会挂着。
+        // - 给任意口令去解**没有加密**的包：完全无副作用（zip 和 tar.gz 都验证过）。
+        //
+        // 所以没有口令时喂一个哨兵值，让它快速失败，由上层弹框问密码再重试。
+        let effectivePass = (passphrase?.isEmpty == false) ? passphrase! : "__no_password__"
+        args += ["--passphrase", effectivePass]
+
         // 跳过 macOS 打包时塞进来的元数据（--exclude 只能挡一层，后面还会统一清一次）
         args += ["--exclude", "__MACOSX", "--exclude", ".DS_Store"]
 
@@ -539,9 +582,7 @@ func performExtract(_ path: String, kind: ArchiveKind, names: [String]?, to dest
         if !group.isEmpty { args += group }
 
         let r = runCommand("/usr/bin/tar", args)
-        guard r.code != 0 else { continue }
         let text = String(data: r.data, encoding: .utf8) ?? ""
-        // bsdtar 对「模式没匹配到任何条目」也返回非 0，这不是解压失败
         let significant = text.split(separator: "\n").filter { line in
             let l = line.lowercased()
             if l.contains("not found in archive") { return false }
@@ -549,20 +590,31 @@ func performExtract(_ path: String, kind: ArchiveKind, names: [String]?, to dest
             if l.trimmingCharacters(in: .whitespaces).isEmpty { return false }
             return true
         }
-        if !significant.isEmpty {
-            failures += significant.map(String.init)
-            break
-        }
+        if significant.isEmpty { continue }
+
+        // 注意：不能只看退出码 —— 口令错误时 bsdtar **依然返回 0**。
+        // 但也不能把它吐的每句话都当失败：像「无法恢复时间戳」这类警告
+        // 在退出码为 0 时是无害的。所以只有「退出码非 0」或「明确的口令问题」
+        // 才判失败。
+        let pwHit = significant.first { isPasswordMessage(String($0), hadPassphrase: passphrase?.isEmpty == false) }
+        if r.code == 0 && pwHit == nil { continue }
+        if pwHit != nil { passwordError = true }
+
+        failures += significant.map(String.init)
+        break
     }
 
     if !failures.isEmpty {
-        return (false, "解压失败。\n\n\(failures.joined(separator: "\n").suffix(700))")
+        // 口令不对时解出来的残片（0 字节文件、CRC 错的垃圾）不能留在缓存里，
+        // 否则下次「文件已存在」会把它当成好文件直接打开。
+        if passwordError { try? fm.removeItem(atPath: dest) }
+        return (false, "解压失败。\n\n\(failures.joined(separator: "\n").suffix(700))", passwordError)
     }
 
     // 清理解压产生的元数据垃圾（__MACOSX、.DS_Store，非 APFS 卷还有 ._xxx）
     cleanupJunk(dest, removeAppleDouble: !volumeSupportsXattr(dest))
 
-    return (true, dest)
+    return (true, dest, false)
 }
 
 // MARK: - 双击打开：缓存
@@ -582,19 +634,18 @@ func stableHash(_ s: String) -> String {
     return String(h, radix: 16)
 }
 
-/// 启动时清掉一天前的缓存。
-/// 保留当次的：用户双击打开的文件可能还开在别的编辑器里，立刻删会让对方报「文件已删除」。
-func purgeStalePreviewCache() {
+/// 严格缓存策略：不保留任何跨会话残留。
+///
+/// - 窗口关闭、应用退出时立即清空（见 AppDelegate）
+/// - 启动时再全清一次，兜住上一次异常退出（崩溃、被强杀）留下的孤儿目录
+///
+/// 代价：双击打开的文件如果在别的程序里还开着，关掉本窗口后那边可能提示
+/// 「文件已被删除」。这里按用户要求以「不占存储」为先。
+func wipePreviewCache() {
     let fm = FileManager.default
     let root = previewCacheRoot()
-    guard let items = try? fm.contentsOfDirectory(atPath: root) else { return }
-    let cutoff = Date().addingTimeInterval(-24 * 3600)
-    for name in items {
-        let p = (root as NSString).appendingPathComponent(name)
-        guard let attrs = try? fm.attributesOfItem(atPath: p),
-              let m = attrs[.modificationDate] as? Date else { continue }
-        if m < cutoff { try? fm.removeItem(atPath: p) }
-    }
+    guard fm.fileExists(atPath: root) else { return }
+    try? fm.removeItem(atPath: root)
 }
 
 
@@ -704,6 +755,30 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
     var encoding: NameEncoding = .auto
     var expandedPaths = Set<String>()
     var firstLoad = true
+
+    /// 本次会话记住的口令。只存在内存里，窗口关掉就跟着进程一起没了。
+    /// 一个包里所有条目共用同一口令（ZIP 允许每个条目不同口令，这里按绝大多数情况处理）。
+    var sessionPassword: String?
+
+    /// 包里是否有加密条目（ZIP 能从中央目录的标志位直接看出来）
+    var hasEncryptedEntries: Bool { rawEntries.contains { $0.encrypted } }
+
+    /// 弹口令框。调用点都在主线程，同步返回。
+    func promptPassword(for name: String, retry: Bool = false) -> String? {
+        let a = NSAlert()
+        a.alertStyle = .informational
+        a.messageText = retry ? "密码不正确" : "这个文件已加密"
+        a.informativeText = "「\(name)」需要口令才能解出内容。\n目录和文件名不需要密码就能看。"
+        a.addButton(withTitle: "确定")
+        a.addButton(withTitle: "取消")
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.placeholderString = "口令"
+        a.accessoryView = field
+        a.window.initialFirstResponder = field
+        guard a.runModal() == .alertFirstButtonReturn else { return nil }
+        let pw = field.stringValue
+        return pw.isEmpty ? nil : pw
+    }
 
     /// 当前真正生效的编码（auto 时取检测结果）
     var effectiveEncoding: NameEncoding { encoding == .auto ? detectedEncoding : encoding }
@@ -1031,6 +1106,8 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
         let total = rawEntries.reduce(Int64(0)) { $0 + $1.size }
 
         var parts = ["\(files.count) 个文件", "\(dirCount) 个文件夹", "解压后约 \(sizeString(total))"]
+        let locked = files.filter { $0.encrypted }.count
+        if locked > 0 { parts.append("\(locked) 个已加密") }
         let query = searchField.stringValue.trimmingCharacters(in: .whitespaces)
         if !query.isEmpty { parts.append("已筛选") }
         statsLabel.stringValue = parts.joined(separator: "  ·  ")
@@ -1046,7 +1123,7 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
             bytes += n.size
         }
         if rows.isEmpty {
-            hintLabel.stringValue = "未选中 → 解压全部内容（双击列表里的文件可直接打开）"
+            hintLabel.stringValue = "未选中 → 解压全部内容（双击文件直接打开；关闭窗口即清除临时文件）"
             selectedLabel.stringValue = ""
         } else {
             hintLabel.stringValue = "已选 \(fileCount) 个文件 · \(sizeString(bytes))"
@@ -1096,7 +1173,8 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
         case "name":
             view.text = node.name
             view.icon = symbolImage(for: node)
-            view.tint = node.isDir ? .controlAccentColor : .tertiaryLabelColor
+            view.tint = node.isDir ? .controlAccentColor
+                                  : (node.encrypted ? .systemOrange : .tertiaryLabelColor)
         case "size":
             view.text = (node.isDir && node.size == 0) ? "—" : sizeString(node.size)
             view.icon = nil
@@ -1108,7 +1186,9 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
     }
 
     func symbolImage(for node: Node) -> NSImage? {
-        let name = node.isDir ? "folder.fill" : fileSymbol(for: node.name)
+        var name = node.isDir ? "folder.fill" : fileSymbol(for: node.name)
+        // 加密条目给个锁，省得用户挨个双击才知道要不要密码
+        if node.encrypted { name = "lock.fill" }
         guard let base = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
         return base.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .regular))
     }
@@ -1195,9 +1275,18 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
             return
         }
 
+        // 加密文件才要口令 —— 列表和目录结构不需要密码就能看，
+        // 所以问口令这一步放在「点开某个文件」的时候，而不是打开包的时候。
+        // ZIP 能从标志位提前知道；rar / 7z 看不出来，就在下面按「口令错误」兜底再问。
+        if node.encrypted && sessionPassword == nil {
+            guard let pw = promptPassword(for: node.name) else { return }
+            sessionPassword = pw
+        }
+
         let enc = effectiveEncoding
         let arc = archivePath
         let kind = self.kind
+        let pw = sessionPassword
         // 先把父目录建好：有些包的目录条目缺失，解压器写子文件时会报 Not a directory
         let dirs = parentChain(of: node.path)
 
@@ -1207,7 +1296,7 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
 
         DispatchQueue.global(qos: .userInitiated).async {
             let r = performExtract(arc, kind: kind, names: [escapeGlob(node.path)],
-                                   to: dest, encoding: enc, dirs: dirs)
+                                   to: dest, encoding: enc, dirs: dirs, passphrase: pw)
             var found = target
             if !FileManager.default.fileExists(atPath: found) {
                 // 兜底：包内路径和实际落盘路径对不上时，按文件名找一遍
@@ -1216,6 +1305,15 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
             DispatchQueue.main.async {
                 self.spinner.stopAnimation(nil)
                 self.busyBox?.isHidden = true
+                if r.passwordError {
+                    // 残片已经被 performExtract 删掉，这里只负责再问一次
+                    self.sessionPassword = nil
+                    if let np = self.promptPassword(for: node.name, retry: true) {
+                        self.sessionPassword = np
+                        self.openMember(node)
+                    }
+                    return
+                }
                 if found.isEmpty {
                     self.showOpenFailure(node, detail: r.msg)
                 } else {
@@ -1343,6 +1441,14 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
     func extract(to dest: String) {
         let sel = selectedExtraction()
         let enc = effectiveEncoding
+
+        // 打包里含加密条目：解压前统一要一次口令。
+        // rar / 7z 事先看不出来，同样靠下面的 passwordError 兜底。
+        if sessionPassword == nil && hasEncryptedEntries {
+            guard let pw = promptPassword(for: (archivePath as NSString).lastPathComponent) else { return }
+            sessionPassword = pw
+        }
+
         // 全量解压时把所有目录都预建出来（兼容目录条目缺失的不规范包）；
         // 只解压选中项时，多建别的目录只会凭空多出空文件夹。
         let dirs: [String]
@@ -1356,12 +1462,24 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
         busyBox?.isHidden = false
         spinner.startAnimation(nil)
         spinnerLabel.stringValue = "正在解压…"
+        let pw = sessionPassword
         DispatchQueue.global(qos: .userInitiated).async {
             let r = performExtract(self.archivePath, kind: self.kind, names: sel?.patterns,
-                                   to: dest, encoding: enc, dirs: dirs)
+                                   to: dest, encoding: enc, dirs: dirs, passphrase: pw)
             DispatchQueue.main.async {
                 self.spinner.stopAnimation(nil)
                 self.busyBox?.isHidden = true
+                if r.passwordError {
+                    self.sessionPassword = nil
+                    let a = NSAlert()
+                    a.alertStyle = .warning
+                    a.messageText = "密码不正确"
+                    a.informativeText = "这个压缩包里的内容有口令保护，需要正确的密码才能解压。"
+                    a.addButton(withTitle: "重新输入")
+                    a.addButton(withTitle: "取消")
+                    if a.runModal() == .alertFirstButtonReturn { self.extract(to: dest) }
+                    return
+                }
                 self.finish(ok: r.ok, msg: r.msg)
             }
         }
@@ -1502,7 +1620,7 @@ func detectAndList(_ path: String) -> ListResult {
 
 // MARK: - 应用生命周期
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 必须强持有：窗口只强引用 vc.view，控制器本身若没人持有会被释放，
     /// outline 的 dataSource / delegate 随之变 nil，表格行会整体消失。
@@ -1512,8 +1630,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        // 顺手回收一天前的预览缓存（双击打开的文件解压到这里）
-        purgeStalePreviewCache()
+        // 上次异常退出（崩溃 / 被强杀）可能留下孤儿缓存，开屏先全清
+        wipePreviewCache()
         let listOnly = CommandLine.arguments.dropFirst().contains("--list")
         let encArg = CommandLine.arguments.dropFirst().first { $0.hasPrefix("--enc=") }?
             .replacingOccurrences(of: "--enc=", with: "")
@@ -1542,6 +1660,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
 
+    /// 关窗口就清缓存：不留下任何临时文件。
+    func windowWillClose(_ notification: Notification) {
+        wipePreviewCache()
+    }
+
+    /// Cmd+Q、或者别的路径退出时再兜一次
+    func applicationWillTerminate(_ notification: Notification) {
+        wipePreviewCache()
+    }
+
     func encodingFrom(_ name: String?) -> NameEncoding {
         switch (name ?? "").lowercased() {
         case "utf8", "utf-8": return .utf8
@@ -1564,7 +1692,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             switch result {
             case .ok(let kind, let entries):
                 let enc = encodingFrom(encName)
-                print("kind=\(kind) 条目=\(entries.count) 编码=\(enc.title)")
+                let locked = entries.filter { $0.encrypted && !$0.isDir }.count
+                print("kind=\(kind) 条目=\(entries.count) 编码=\(enc.title)"
+                      + (locked > 0 ? " 加密=\(locked)" : ""))
                 var items: [(String, RawEntry)] = []
                 for e in entries {
                     items.append((decodeName(e.nameBytes, enc, utf8Flagged: e.utf8Flag), e))
@@ -1573,7 +1703,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 func dump(_ n: Node, _ depth: Int) {
                     for c in n.children.prefix(80) {
                         let pad = String(repeating: "  ", count: depth)
-                        print("\(pad)\(c.isDir ? "📁" : "  ") \(c.name)  [\(sizeString(c.size))]")
+                        let lock = c.encrypted ? "🔒 " : ""
+                        print("\(pad)\(c.isDir ? "📁" : "  ") \(lock)\(c.name)  [\(sizeString(c.size))]")
                         if c.isDir { dump(c, depth + 1) }
                     }
                 }
@@ -1591,6 +1722,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .ok(let kind, let entries):
             let c = PreviewController(path: path, kind: kind, entries: entries)
             if let e = encName { c.encoding = encodingFrom(e) }
+            // 调试用：--pass=xxx 相当于用户已经输过口令，便于命令行验证加密包
+            if let p = CommandLine.arguments.first(where: { $0.hasPrefix("--pass=") }) {
+                c.sessionPassword = String(p.dropFirst("--pass=".count))
+            }
             // 隐藏参数：命令行直接解压，不弹窗口（用于验证解压逻辑 / 脚本调用）
             if let arg = CommandLine.arguments.first(where: { $0.hasPrefix("--extract=") }) {
                 let dest = String(arg.dropFirst("--extract=".count))
@@ -1613,8 +1748,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 let r = performExtract(path, kind: kind,
                                        names: rawItems.isEmpty ? nil : rawItems.map(escapeGlob),
-                                       to: dest, encoding: enc, dirs: dirs)
+                                       to: dest, encoding: enc, dirs: dirs,
+                                       passphrase: c.sessionPassword)
                 print("编码=\(enc.title)")
+                if r.passwordError { print("NEED_PASSWORD") }
                 print(r.ok ? "OK: \(r.msg)" : "FAIL: \(r.msg)")
                 exit(r.ok ? 0 : 1)
             }
@@ -1635,6 +1772,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         container.autoresizingMask = [.width, .height]
         win.contentView = container
         win.isReleasedWhenClosed = false
+        // 关窗即清缓存，所以要把自己挂成窗口代理
+        win.delegate = self
         // 关键：强持有控制器，否则它会被释放，outline 的 dataSource 变 nil，表格行全部消失
         self.controller = vc
         // 用窗口自身背景色，不要给容器开 wantsLayer
