@@ -460,6 +460,33 @@ func cleanupJunk(_ dest: String, removeAppleDouble: Bool) {
     _ = runCommand("/usr/bin/find", args)
 }
 
+// MARK: - 通配符转义
+
+/// 给名字里的 shell 通配符加反斜杠转义。
+/// libarchive 把传给它的名字当 pattern 解释，「报告[2024].txt」会被理解成
+/// 「报告 后面跟 2/0/2/4 中任意一个字符」，于是匹配不到任何条目、解压直接失败。
+/// bsdtar 3.5 没有 --no-wildcards 开关，只能靠转义。
+func escapeGlob(_ s: String) -> String {
+    var out = ""
+    for ch in s {
+        if "*?[]\\".contains(ch) { out.append("\\") }
+        out.append(ch)
+    }
+    return out
+}
+
+/// 某个成员路径的所有上级目录（从最近一级往上）。
+/// 解压前只预建这些就够了 —— 把包里全部目录都建出来会凭空多出一堆空文件夹。
+func parentChain(of path: String) -> [String] {
+    var out: [String] = []
+    var p = (path as NSString).deletingLastPathComponent
+    while !p.isEmpty, p != ".", p != "/", !out.contains(p) {
+        out.append(p)
+        p = (p as NSString).deletingLastPathComponent
+    }
+    return out
+}
+
 func performExtract(_ path: String, kind: ArchiveKind, names: [String]?, to dest: String,
                     encoding: NameEncoding, dirs: [String]) -> (ok: Bool, msg: String) {
     let fm = FileManager.default
@@ -477,25 +504,42 @@ func performExtract(_ path: String, kind: ArchiveKind, names: [String]?, to dest
         try? fm.createDirectory(atPath: full, withIntermediateDirectories: true)
     }
 
-    var args: [String] = []
-
-    // 关键修复：ZIP 解压不再用 unzip。
-    // /usr/bin/unzip 按 CP437 解释没有 UTF-8 标志位的文件名，GBK 中文名会被解成
-    // 一堆问号和非法字节，随后 mkdir 直接 EINVAL（就是「checkdir error: Invalid argument」）。
-    // 改用系统自带的 libarchive（bsdtar），显式告诉它头部字符集，
-    // 与列表显示用的编码保持一致，解出来的名字才不会跟预览对不上。
-    if kind == .zip, let cs = encoding.archiveCharset {
-        args += ["--options", "hdrcharset=\(cs)"]
+    // 参数太多会撞 ARG_MAX，超过就分批
+    var groups: [[String]] = []
+    if let names {
+        if names.count > 800 {
+            var i = 0
+            while i < names.count {
+                groups.append(Array(names[i..<min(i + 800, names.count)]))
+                i += 800
+            }
+        } else if !names.isEmpty {
+            groups.append(names)
+        }
     }
+    if groups.isEmpty { groups.append([]) }   // 空数组 = 解压全部
 
-    // 跳过 macOS 打包时塞进来的元数据（tar 的 --exclude 只能挡一层，后面还会统一清一次）
-    args += ["--exclude", "__MACOSX", "--exclude", ".DS_Store"]
+    var failures: [String] = []
+    for group in groups {
+        var args: [String] = []
 
-    args += ["-xf", path, "-C", dest]
-    if let names { args += names }
+        // 关键修复：ZIP 解压不再用 unzip。
+        // /usr/bin/unzip 按 CP437 解释没有 UTF-8 标志位的文件名，GBK 中文名会被解成
+        // 一堆问号和非法字节，随后 mkdir 直接 EINVAL（就是「checkdir error: Invalid argument」）。
+        // 改用系统自带的 libarchive（bsdtar），显式告诉它头部字符集，
+        // 与列表显示用的编码保持一致，解出来的名字才不会跟预览对不上。
+        if kind == .zip, let cs = encoding.archiveCharset {
+            args += ["--options", "hdrcharset=\(cs)"]
+        }
 
-    let r = runCommand("/usr/bin/tar", args)
-    if r.code != 0 {
+        // 跳过 macOS 打包时塞进来的元数据（--exclude 只能挡一层，后面还会统一清一次）
+        args += ["--exclude", "__MACOSX", "--exclude", ".DS_Store"]
+
+        args += ["-xf", path, "-C", dest]
+        if !group.isEmpty { args += group }
+
+        let r = runCommand("/usr/bin/tar", args)
+        guard r.code != 0 else { continue }
         let text = String(data: r.data, encoding: .utf8) ?? ""
         // bsdtar 对「模式没匹配到任何条目」也返回非 0，这不是解压失败
         let significant = text.split(separator: "\n").filter { line in
@@ -505,10 +549,14 @@ func performExtract(_ path: String, kind: ArchiveKind, names: [String]?, to dest
             if l.trimmingCharacters(in: .whitespaces).isEmpty { return false }
             return true
         }
-        // 有真正的错误才判定失败；只是模式没匹配到也算成功（照样走清理）
         if !significant.isEmpty {
-            return (false, "解压失败。\n\n\(significant.joined(separator: "\n").suffix(700))")
+            failures += significant.map(String.init)
+            break
         }
+    }
+
+    if !failures.isEmpty {
+        return (false, "解压失败。\n\n\(failures.joined(separator: "\n").suffix(700))")
     }
 
     // 清理解压产生的元数据垃圾（__MACOSX、.DS_Store，非 APFS 卷还有 ._xxx）
@@ -516,6 +564,39 @@ func performExtract(_ path: String, kind: ArchiveKind, names: [String]?, to dest
 
     return (true, dest)
 }
+
+// MARK: - 双击打开：缓存
+
+/// 预览缓存根目录。双击文件时解压到这里，再用系统默认程序打开。
+func previewCacheRoot() -> String {
+    let base = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first
+        ?? NSTemporaryDirectory()
+    return (base as NSString).appendingPathComponent("com.local.archivepreview/preview")
+}
+
+/// FNV-1a 哈希。不能用 String.hashValue —— Swift 每次启动会换随机种子，跨进程不稳定，
+/// 那样每次开同一个包都会生成新缓存目录。
+func stableHash(_ s: String) -> String {
+    var h: UInt32 = 2166136261
+    for b in s.utf8 { h = (h ^ UInt32(b)) &* 16777619 }
+    return String(h, radix: 16)
+}
+
+/// 启动时清掉一天前的缓存。
+/// 保留当次的：用户双击打开的文件可能还开在别的编辑器里，立刻删会让对方报「文件已删除」。
+func purgeStalePreviewCache() {
+    let fm = FileManager.default
+    let root = previewCacheRoot()
+    guard let items = try? fm.contentsOfDirectory(atPath: root) else { return }
+    let cutoff = Date().addingTimeInterval(-24 * 3600)
+    for name in items {
+        let p = (root as NSString).appendingPathComponent(name)
+        guard let attrs = try? fm.attributesOfItem(atPath: p),
+              let m = attrs[.modificationDate] as? Date else { continue }
+        if m < cutoff { try? fm.removeItem(atPath: p) }
+    }
+}
+
 
 // MARK: - 界面辅助
 
@@ -798,6 +879,9 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
         outline.dataSource = self
         outline.delegate = self
         outline.style = .automatic
+        // 双击：文件 → 解压到缓存并用系统默认程序打开；文件夹 → 展开/折叠
+        outline.target = self
+        outline.doubleAction = #selector(rowDoubleClicked(_:))
 
         let scroll = NSScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
@@ -962,7 +1046,7 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
             bytes += n.size
         }
         if rows.isEmpty {
-            hintLabel.stringValue = "未选中 → 解压全部内容"
+            hintLabel.stringValue = "未选中 → 解压全部内容（双击列表里的文件可直接打开）"
             selectedLabel.stringValue = ""
         } else {
             hintLabel.stringValue = "已选 \(fileCount) 个文件 · \(sizeString(bytes))"
@@ -1070,28 +1154,163 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
 
     @objc func cancelTapped(_ sender: Any) { NSApp.terminate(nil) }
 
+    // MARK: 双击打开
+
+    @objc func rowDoubleClicked(_ sender: Any) {
+        var row = outline.clickedRow
+        if row < 0 { row = outline.selectedRow }
+        guard row >= 0, let node = outline.item(atRow: row) as? Node else { return }
+        if node.isDir {
+            // 自己接管了 doubleAction，NSOutlineView 默认的双击展开就不生效了，这里补上
+            if outline.isItemExpanded(node) { outline.collapseItem(node) }
+            else { outline.expandItem(node) }
+            return
+        }
+        openMember(node)
+    }
+
+    /// 按行号打开（调试用，逻辑与双击一致）
+    func openRow(_ row: Int) {
+        guard row >= 0, row < outline.numberOfRows,
+              let node = outline.item(atRow: row) as? Node, !node.isDir else { return }
+        openMember(node)
+    }
+
+    /// 本次会话的缓存目录。按「压缩包路径 + 大小 + 修改时间」区分，
+    /// 包一改动就换目录，不会把旧内容当成新内容打开。
+    var memberCacheDir: String {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: archivePath)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        let mtime = Int((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
+        return (previewCacheRoot() as NSString)
+            .appendingPathComponent(stableHash("\(archivePath)|\(size)|\(mtime)"))
+    }
+
+    func openMember(_ node: Node) {
+        let dest = memberCacheDir
+        let target = (dest as NSString).appendingPathComponent(node.path)
+        // 已经解过一次就直接复用，免得同一个文件双击两次解两次
+        if FileManager.default.fileExists(atPath: target) {
+            launch(URL(fileURLWithPath: target))
+            return
+        }
+
+        let enc = effectiveEncoding
+        let arc = archivePath
+        let kind = self.kind
+        // 先把父目录建好：有些包的目录条目缺失，解压器写子文件时会报 Not a directory
+        let dirs = parentChain(of: node.path)
+
+        busyBox?.isHidden = false
+        spinner.startAnimation(nil)
+        spinnerLabel.stringValue = "正在打开…"
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = performExtract(arc, kind: kind, names: [escapeGlob(node.path)],
+                                   to: dest, encoding: enc, dirs: dirs)
+            var found = target
+            if !FileManager.default.fileExists(atPath: found) {
+                // 兜底：包内路径和实际落盘路径对不上时，按文件名找一遍
+                found = Self.findMember(node.name, under: dest) ?? ""
+            }
+            DispatchQueue.main.async {
+                self.spinner.stopAnimation(nil)
+                self.busyBox?.isHidden = true
+                if found.isEmpty {
+                    self.showOpenFailure(node, detail: r.msg)
+                } else {
+                    self.launch(URL(fileURLWithPath: found))
+                }
+            }
+        }
+    }
+
+    static func findMember(_ name: String, under dir: String) -> String? {
+        let fm = FileManager.default
+        guard let en = fm.enumerator(atPath: dir) else { return nil }
+        for case let rel as String in en {
+            guard (rel as NSString).lastPathComponent == name else { continue }
+            let full = (dir as NSString).appendingPathComponent(rel)
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: full, isDirectory: &isDir), !isDir.boolValue { return full }
+        }
+        return nil
+    }
+
+    /// 会被系统当成「程序」直接执行的类型。压缩包来源不明时不能替用户按下运行键，
+    /// 解压后只在访达里选中，由用户自己决定。
+    static let runnableExtensions: Set<String> = [
+        "app", "pkg", "mpkg", "command", "workflow", "scpt", "scptd", "terminal", "action"
+    ]
+
+    func launch(_ url: URL) {
+        // 调试开关：只打印路径不真的启动，便于命令行验证
+        if ProcessInfo.processInfo.environment["AP_NO_LAUNCH"] == "1" {
+            print(url.path)
+            NSApp.terminate(nil)
+            return
+        }
+        let ws = NSWorkspace.shared
+        if Self.runnableExtensions.contains(url.pathExtension.lowercased()) {
+            ws.activateFileViewerSelecting([url])
+            let a = NSAlert()
+            a.alertStyle = .informational
+            a.messageText = "「\(url.lastPathComponent)」是可执行程序"
+            a.informativeText = "出于安全考虑，压缩包里的程序不会被直接运行。\n已经解压并在访达中选中，确认来源可靠后再双击打开。"
+            a.addButton(withTitle: "好")
+            a.runModal()
+            return
+        }
+        if ws.urlForApplication(toOpen: url) != nil {
+            ws.open(url)
+        } else {
+            // 系统里没有能打开这种类型的程序，退一步在访达里选中它
+            ws.activateFileViewerSelecting([url])
+        }
+    }
+
+    func showOpenFailure(_ node: Node, detail: String) {
+        if ProcessInfo.processInfo.environment["AP_NO_LAUNCH"] == "1" {
+            let msg = "打开失败: \(node.path)\n\(detail)\n"
+            FileHandle.standardError.write(msg.data(using: .utf8)!)
+            NSApp.terminate(nil)
+            return
+        }
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "无法打开「\(node.name)」"
+        a.informativeText = detail.isEmpty ? "解压这个文件时出错了。" : detail
+        a.addButton(withTitle: "好")
+        a.runModal()
+    }
+
     // MARK: 解压
 
-    /// 选中项 → 解压成员名（目录用通配符包含其下全部内容）
-    func selectedNames() -> [String]? {
+    /// 选中项 → libarchive 的匹配 pattern（已转义）。
+    /// 目录用「dir/」形式 —— libarchive 认这个前缀，会递归解出整个子树，
+    /// 比自己展开成几千个成员名简洁得多。
+    /// 同时返回需要预建的父目录链。
+    func selectedExtraction() -> (patterns: [String], parents: [String])? {
         let rows = outline.selectedRowIndexes
         if rows.isEmpty { return nil }
-        var names: [String] = []
+        var patterns: [String] = []
+        var parents: [String] = []
         var seen = Set<String>()
         for r in rows {
-            guard let n = outline.item(atRow: r) as? Node else { continue }
-            guard !n.path.isEmpty else { continue }
-            let key = n.isDir ? n.path + "/*" : n.path
-            if seen.insert(key).inserted { names.append(key) }
+            guard let n = outline.item(atRow: r) as? Node, !n.path.isEmpty else { continue }
+            let pattern = n.isDir ? escapeGlob(n.path) + "/" : escapeGlob(n.path)
+            if seen.insert(pattern).inserted { patterns.append(pattern) }
+            for p in parentChain(of: n.path) where !parents.contains(p) { parents.append(p) }
         }
-        return names.isEmpty ? nil : names
+        return patterns.isEmpty ? nil : (patterns, parents)
     }
 
     @objc func hereTapped(_ sender: Any) {
         let parent = (archivePath as NSString).deletingLastPathComponent
         let folderName = (parent as NSString).lastPathComponent
-        let names = selectedNames()
-        let count = names == nil ? rawEntries.filter { !$0.isDir }.count : outline.selectedRowIndexes.count
+        let count = outline.selectedRowIndexes.isEmpty
+            ? rawEntries.filter { !$0.isDir }.count
+            : outline.selectedRowIndexes.count
         guard confirm("把选中的 \(count) 项解压到「\(folderName)」？\n\n注意：不会自动新建子文件夹，解压出来的内容会直接散落在该目录里。") else { return }
         extract(to: parent)
     }
@@ -1122,16 +1341,23 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
     }
 
     func extract(to dest: String) {
-        let names = selectedNames()
+        let sel = selectedExtraction()
         let enc = effectiveEncoding
-        let dirs = rawEntries.filter { $0.isDir }
+        // 全量解压时把所有目录都预建出来（兼容目录条目缺失的不规范包）；
+        // 只解压选中项时，多建别的目录只会凭空多出空文件夹。
+        let dirs: [String]
+        if let sel {
+            dirs = sel.parents
+        } else {
+            dirs = rawEntries.filter { $0.isDir }
                               .map { decodeName($0.nameBytes, enc, utf8Flagged: $0.utf8Flag) }
                               .filter { !$0.isEmpty }
+        }
         busyBox?.isHidden = false
         spinner.startAnimation(nil)
         spinnerLabel.stringValue = "正在解压…"
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = performExtract(self.archivePath, kind: self.kind, names: names,
+            let r = performExtract(self.archivePath, kind: self.kind, names: sel?.patterns,
                                    to: dest, encoding: enc, dirs: dirs)
             DispatchQueue.main.async {
                 self.spinner.stopAnimation(nil)
@@ -1286,6 +1512,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // 顺手回收一天前的预览缓存（双击打开的文件解压到这里）
+        purgeStalePreviewCache()
         let listOnly = CommandLine.arguments.dropFirst().contains("--list")
         let encArg = CommandLine.arguments.dropFirst().first { $0.hasPrefix("--enc=") }?
             .replacingOccurrences(of: "--enc=", with: "")
@@ -1367,11 +1595,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if let arg = CommandLine.arguments.first(where: { $0.hasPrefix("--extract=") }) {
                 let dest = String(arg.dropFirst("--extract=".count))
                 let enc = c.effectiveEncoding
-                let dirs = entries.filter { $0.isDir }
-                                  .map { decodeName($0.nameBytes, enc, utf8Flagged: $0.utf8Flag) }
-                                  .filter { !$0.isEmpty }
-                let r = performExtract(path, kind: kind, names: nil, to: dest,
-                                       encoding: enc, dirs: dirs)
+                // --extract-item=<相对路径> 可重复，只解压指定项（目录写 dir/ 表示整个子树）
+                let rawItems = CommandLine.arguments
+                    .filter { $0.hasPrefix("--extract-item=") }
+                    .map { String($0.dropFirst("--extract-item=".count)) }
+                // 全量解压时预建所有目录；定向解压只建所选项的父目录
+                let allDirs = entries.filter { $0.isDir }
+                                     .map { decodeName($0.nameBytes, enc, utf8Flagged: $0.utf8Flag) }
+                                     .filter { !$0.isEmpty }
+                var dirs = allDirs
+                if !rawItems.isEmpty {
+                    dirs = []
+                    for item in rawItems {
+                        let bare = item.hasSuffix("/") ? String(item.dropLast()) : item
+                        for p in parentChain(of: bare) where !dirs.contains(p) { dirs.append(p) }
+                    }
+                }
+                let r = performExtract(path, kind: kind,
+                                       names: rawItems.isEmpty ? nil : rawItems.map(escapeGlob),
+                                       to: dest, encoding: enc, dirs: dirs)
                 print("编码=\(enc.title)")
                 print(r.ok ? "OK: \(r.msg)" : "FAIL: \(r.msg)")
                 exit(r.ok ? 0 : 1)
@@ -1415,6 +1657,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if let pc = vc as? PreviewController, row < pc.outline.numberOfRows {
                     pc.outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
                 }
+            }
+        }
+        // 隐藏调试开关：模拟双击第 N 行（配合 AP_NO_LAUNCH=1 只打印解压出的路径）
+        if let arg = CommandLine.arguments.first(where: { $0.hasPrefix("--open=") }) {
+            let row = Int(arg.dropFirst("--open=".count)) ?? 0
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                (vc as? PreviewController)?.openRow(row)
             }
         }
         if let arg = CommandLine.arguments.first(where: { $0.hasPrefix("--snapshot=") }) {

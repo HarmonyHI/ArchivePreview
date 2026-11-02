@@ -21,6 +21,7 @@ macOS 自带的「归档实用工具」只要双击就开始解压，不管你�
 | 功能 | 说明 |
 |---|---|
 | 树形目录 | 文件夹可展开/折叠，默认全部折叠，只显示顶层；工具栏有「展开全部」「折叠」 |
+| 双击打开 | 双击文件直接解压到缓存并用系统默认程序打开，不用先解压整个包；双击文件夹展开/折叠 |
 | 字符集切换 | 自动识别 / UTF-8 / GB18030-GBK / Big5 / Shift-JIS / EUC-KR / Latin-1，切换时保留展开状态 |
 | 解压同编码 | 解出后的文件名和列表里看到的一致，不会「预览正常、解压乱码」 |
 | 选择性解压 | 解压选中项 / 解压全部 / 解压到同名文件夹 |
@@ -114,6 +115,8 @@ macOS 的 `/usr/bin/tar` 就是 bsdtar（libarchive 3.7.4），内置 7z 和 rar
 - **`._xxx` 影子文件枚举不到**。macOS 在 ExFAT / FAT32 这类卷上会为每个文件额外写 `._同名`，但这些文件被系统当作 AppleDouble，`FileManager.enumerator` 和 `contentsOfDirectory` **都看不见**（`ls`、`find` 能看见）。清理只能借助 `find`，不能在 Swift 里遍历。
 - **`find -delete` 删不掉非空目录**，`__MACOSX` 里装着 `._` 文件，必须用 `-exec rm -rf {} +`。
 - **tar 的 `--exclude "__MACOSX/*"` 只能挡一层**，深层目录照样会被建出来。别指望前置排除，统一在解压后清理。
+- **传给 libarchive 的文件名会被当成 shell pattern**。`报告[2024].txt` 里的 `[2024]` 被理解为字符类，匹配不到任何条目、解压失败；bsdtar 3.5 没有 `--no-wildcards` 开关，只能自己在 `* ? [ ] \` 前加反斜杠转义（见 `escapeGlob`）。
+- **`dir/` 前缀会递归匹配整个子树**。所以「解压选中的文件夹」不需要自己展开成几千个成员名，传 `dir/` 一个 pattern 就够，空目录也能建出来。
 
 ## 调试参数
 
@@ -131,6 +134,13 @@ macOS 的 `/usr/bin/tar` 就是 bsdtar（libarchive 3.7.4），内置 7z 和 rar
 
 # 直接解压到指定目录，不开窗口（会打印所用的编码）
 "... 压缩包预览器" test.zip --extract=/tmp/out
+
+# 只解压其中几项（目录写 dir/ 表示整个子树，可重复）
+"... 压缩包预览器" test.zip --extract=/tmp/out \
+    --extract-item="毕业设计2024/论文正文.docx" --extract-item="图片/"
+
+# 模拟双击第 N 行；加 AP_NO_LAUNCH=1 只打印解压出的路径，不真的启动程序
+AP_NO_LAUNCH=1 "... 压缩包预览器" test.zip --expand --open=4
 ```
 
 `--snapshot=` 是进程内用 `wantsLayer + display() + layer.render()` 输出图片的。`--expand` 展开全部目录，`--select=N` 选中第 N 行。
@@ -154,8 +164,19 @@ ArchivePreview/
 - 只读，不支持在预览界面里增删改文件
 - 没有做代码签名和公证，别人下载后首次运行需右键 → 打开
 - 压缩包里如果含 ExFAT / Windows 不允许的字符（`: * ? " < > |`），解到那块盘上会被系统拒绝
+- 双击打开的文件会解压到 `~/Library/Caches/com.local.archivepreview/preview/`，
+  启动时自动清理一天前的缓存（当次打开的文件不受影响）
+- 压缩包里的 `.app` / `.pkg` / `.command` 不会被自动运行，只在访达里选中
 
 ## 更新记录
+
+### v1.3
+
+- 双击列表里的文件，直接解压该文件并用系统默认程序打开，不必先解压整个包；
+  双击文件夹展开/折叠
+- 修掉文件名含 `[ ] * ?` 时定向解压失败（libarchive 把名字当通配符）
+- 选中文件夹解压不再额外建出无关的空目录
+- 新增 `--extract-item=` / `--open=` 两个调试参数
 
 ### v1.2
 
