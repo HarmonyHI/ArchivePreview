@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+._*
+
+# 编译产物
+bin/
+build/
+*.o
+*.dSYM/
+
+# Swift Package Manager（如果以后改成 SPM 工程）
+.build/
+Package.resolved
+
+# 本地测试用的压缩包样本
+samples/
+*.zip
+*.rar
+*.7z
