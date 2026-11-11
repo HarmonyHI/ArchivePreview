@@ -14,7 +14,8 @@ permissions:
 
 jobs:
   build-and-release:
-    runs-on: macos-14
+    # macos-14 镜像已于 2026-11-02 退役，固定用 macos-15
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -73,7 +74,7 @@ jobs:
             shasum -a 256 "ArchivePreview-${VER}.dmg" "ArchivePreview-${VER}.zip"
             echo '```'
             echo ""
-            echo "构建于 GitHub Actions（macos-14），提交 \`${GITHUB_SHA:0:7}\`。"
+            echo "构建于 GitHub Actions（macos-15），提交 \`${GITHUB_SHA:0:7}\`。"
           } >> body.md
 
       - name: Publish release
