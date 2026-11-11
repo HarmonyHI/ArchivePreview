@@ -1271,7 +1271,7 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
         let target = (dest as NSString).appendingPathComponent(node.path)
         // 已经解过一次就直接复用，免得同一个文件双击两次解两次
         if FileManager.default.fileExists(atPath: target) {
-            launch(URL(fileURLWithPath: target))
+            launchMember(target)
             return
         }
 
@@ -1317,7 +1317,7 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
                 if found.isEmpty {
                     self.showOpenFailure(node, detail: r.msg)
                 } else {
-                    self.launch(URL(fileURLWithPath: found))
+                    self.launchMember(found)
                 }
             }
         }
@@ -1340,6 +1340,58 @@ class PreviewController: NSViewController, NSOutlineViewDataSource, NSOutlineVie
     static let runnableExtensions: Set<String> = [
         "app", "pkg", "mpkg", "command", "workflow", "scpt", "scptd", "terminal", "action"
     ]
+
+    /// 双击打开时会被当成压缩包、转交预览的类型（与 detectAndList 认识的格式保持一致）。
+    static let archiveExtensions: Set<String> = [
+        "zip", "ipa", "jar", "whl", "apk", "zipx", "xpi", "crx",
+        "tar", "tgz", "gz", "bz2", "xz", "cpio", "rar", "7z", "cbr", "cb7"
+    ]
+
+    /// 双击打开包内条目。条目本身是压缩包时走 openAsArchive 转交预览，
+    /// 其余交给系统默认程序。
+    func launchMember(_ path: String) {
+        if Self.archiveExtensions.contains((path as NSString).pathExtension.lowercased()) {
+            openAsArchive(path)
+        } else {
+            launch(URL(fileURLWithPath: path))
+        }
+    }
+
+    /// 把包内的压缩包复制到独立缓存目录后再交给系统打开。
+    ///
+    /// 不能直接用解压缓存里的那份：内层预览窗口还开着时，如果外层窗口先关了，
+    /// 关窗清缓存会把内层预览的源文件删掉；复制一份让它独立存活。
+    /// 系统会把打开事件路由回本实例（自己就是归档的默认处理程序），
+    /// AppDelegate 收到 odoc 事件后会再开一个预览窗口。
+    func openAsArchive(_ src: String) {
+        let fm = FileManager.default
+        let dir = (previewCacheRoot() as NSString)
+            .appendingPathComponent("nested-\(UUID().uuidString)")
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let copy = (dir as NSString).appendingPathComponent((src as NSString).lastPathComponent)
+        do {
+            if fm.fileExists(atPath: copy) { try fm.removeItem(atPath: copy) }
+            try fm.copyItem(atPath: src, toPath: copy)
+        } catch {
+            // 复制失败不致命：退回直接打开原文件
+            launch(URL(fileURLWithPath: src))
+            return
+        }
+        launch(URL(fileURLWithPath: copy))
+    }
+
+    /// 只清本窗口自己的成员缓存目录。
+    /// 多窗口下别的窗口可能还在用缓存根里的其他目录，不能整树全清；
+    /// 最后一个窗口关闭会触发进程退出，由 applicationWillTerminate 做全清兜底。
+    func wipeOwnCache() {
+        try? FileManager.default.removeItem(atPath: memberCacheDir)
+        // openAsArchive 复制的内层包所在的独立目录（nested-*）
+        let parent = (archivePath as NSString).deletingLastPathComponent
+        if (parent as NSString).lastPathComponent.hasPrefix("nested-"),
+           parent.hasPrefix(previewCacheRoot()) {
+            try? FileManager.default.removeItem(atPath: parent)
+        }
+    }
 
     func launch(_ url: URL) {
         // 调试开关：只打印路径不真的启动，便于命令行验证
@@ -1622,9 +1674,11 @@ func detectAndList(_ path: String) -> ListResult {
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
-    /// 必须强持有：窗口只强引用 vc.view，控制器本身若没人持有会被释放，
+    /// 每个打开的预览窗口 → 它的控制器。必须强持有：控制器若没人持有会被释放，
     /// outline 的 dataSource / delegate 随之变 nil，表格行会整体消失。
-    var controller: NSViewController?
+    var windows: [NSWindow: NSViewController] = [:]
+    /// 归档路径 → 预览窗口。同一个包已经开着时把窗口调到前面，不重复开。
+    var windowByPath: [String: NSWindow] = [:]
     var openedOnce = false
     var delivered = false
 
@@ -1648,21 +1702,38 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    /// 打开事件（Finder 双击 / NSWorkspace.open 路由回来的嵌套压缩包）统一走这里。
+    /// 本 app 自己就是归档格式的默认处理程序，所以双击预览窗口里的内层压缩包时，
+    /// 系统会把打开事件发回正在运行的本实例 —— 这里再开一个预览窗口。
     func application(_ sender: NSApplication, openFile filename: String) -> Bool {
+        deliverOpen(path: filename)
+        return true
+    }
+
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        for f in filenames { deliverOpen(path: f) }
+    }
+
+    func deliverOpen(path: String) {
         delivered = true
-        guard !openedOnce else { return true }
+        guard FileManager.default.fileExists(atPath: path) else { return }
         let listOnly = CommandLine.arguments.contains("--list")
         let encArg = CommandLine.arguments.first { $0.hasPrefix("--enc=") }?
             .replacingOccurrences(of: "--enc=", with: "")
-        DispatchQueue.main.async { self.handle(path: filename, listOnly: listOnly, encName: encArg) }
-        return true
+        DispatchQueue.main.async { self.handle(path: path, listOnly: listOnly, encName: encArg) }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
 
-    /// 关窗口就清缓存：不留下任何临时文件。
+    /// 关窗口只清这个窗口自己的缓存。
+    /// 多窗口下别的预览窗口可能还在用缓存根里的其他目录，不能整树全清；
+    /// 最后一个窗口关闭会触发进程退出，由 applicationWillTerminate 做全清兜底。
     func windowWillClose(_ notification: Notification) {
-        wipePreviewCache()
+        guard let win = notification.object as? NSWindow else { return }
+        guard let vc = windows[win] else { return }
+        windows[win] = nil
+        windowByPath = windowByPath.filter { $0.value !== win }
+        if let pc = vc as? PreviewController { pc.wipeOwnCache() }
     }
 
     /// Cmd+Q、或者别的路径退出时再兜一次
@@ -1683,8 +1754,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func handle(path: String, listOnly: Bool, encName: String?) {
-        guard !openedOnce else { return }
         openedOnce = true
+
+        // 同一个包已经开着预览窗口：把窗口调到前面就返回，不重复开。
+        // （要放在 openedOnce 之后 —— 它还兼着兜底定时器和 odoc 事件的去重。）
+        if !listOnly, let existing = windowByPath[path], existing.isVisible {
+            existing.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
 
         let result = detectAndList(path)
 
@@ -1765,17 +1843,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let win = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                            styleMask: [.titled, .closable, .resizable],
                            backing: .buffered, defer: false)
-        win.title = "压缩包预览器"
+        // 多窗口下用包名区分窗口
+        win.title = "\((path as NSString).lastPathComponent) — 压缩包预览器"
         // 注意：不要用 contentViewController —— 它会把窗口压成 Auto Layout 的最小拟合尺寸
         let container = vc.view
         container.frame = NSRect(origin: .zero, size: size)
         container.autoresizingMask = [.width, .height]
         win.contentView = container
         win.isReleasedWhenClosed = false
-        // 关窗即清缓存，所以要把自己挂成窗口代理
+        // 关窗清自己的缓存，所以要把自己挂成窗口代理
         win.delegate = self
         // 关键：强持有控制器，否则它会被释放，outline 的 dataSource 变 nil，表格行全部消失
-        self.controller = vc
+        self.windows[win] = vc
+        self.windowByPath[path] = win
         // 用窗口自身背景色，不要给容器开 wantsLayer
         win.backgroundColor = NSColor.windowBackgroundColor
         win.setContentSize(size)
